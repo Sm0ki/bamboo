@@ -46,6 +46,7 @@ BlockChain::BlockChain(HostManager& hosts, string ledgerPath, string blockPath, 
     this->ledger.init(ledgerPath);
     this->blockStore.init(blockPath);
     this->txdb.init(txdbPath);
+    hosts.setBlockstore(&this->blockStore);
     this->initChain();
 }
 
@@ -54,6 +55,7 @@ BlockChain::~BlockChain() {
 }
 
 void BlockChain::initChain() {
+    this->isSyncing = false;
     if (blockStore.hasBlockCount()) {
         Logger::logStatus("BlockStore exists, loading from disk");
         size_t count = blockStore.getBlockCount();
@@ -106,7 +108,13 @@ void BlockChain::resetChain() {
 
     // writeJsonToFile(genesis.toJson(), "genesis.json");
 
-    json genesisJson = readJsonFromFile("genesis.json");
+    json genesisJson;
+    try {
+         genesisJson = readJsonFromFile("genesis.json");
+    } catch(...) {
+        Logger::logError(RED + "[FATAL]" + RESET, "Could not load genesis.json file.");
+        exit(-1);
+    }
     Block genesis(genesisJson);
 
     ExecutionStatus status = this->addBlock(genesis);
@@ -150,12 +158,12 @@ uint32_t BlockChain::getBlockCount() {
     return this->numBlocks;
 }
 
-uint32_t BlockChain::getCurrentMiningFee() {
+uint32_t BlockChain::getCurrentMiningFee(uint64_t blockId) {
     // NOTE:
     // The chain was forked three times, once at 7,750 and again at 125,180, then at 18k
     // Thus we push the chain ahead by this count.
     // SEE: https://bitcointalk.org/index.php?topic=5372707.msg58965610#msg58965610
-    uint64_t logicalBlock = this->numBlocks + 125180 + 7750 + 18000;
+    uint64_t logicalBlock = blockId + 125180 + 7750 + 18000;
     if (logicalBlock < 1000000) {
         return BMB(50.0);
     } else if (logicalBlock < 2000000) {
@@ -177,6 +185,7 @@ Block BlockChain::getBlock(uint32_t blockId) {
 }
 
 ExecutionStatus BlockChain::verifyTransaction(const Transaction& t) {
+    if (this->isSyncing) return IS_SYNCING;
     if (t.isFee()) return EXTRA_MINING_FEE;
     if (!t.signatureValid()) return INVALID_SIGNATURE;
     LedgerState deltas;
@@ -266,6 +275,22 @@ uint8_t BlockChain::getDifficulty() {
     return this->difficulty;
 }
 
+vector<Transaction> BlockChain::getTransactionsForWallet(PublicWalletAddress addr) {
+    vector<SHA256Hash> txids = this->blockStore.getTransactionsForWallet(addr);
+    vector<Transaction> ret;
+    // TODO: this is pretty inefficient -- might want direct index of transactions
+    for (auto txid : txids) {
+        Block b = this->blockStore.getBlock(this->txdb.blockForTransactionId(txid));
+        for (auto tx : b.getTransactions()) {
+            if (tx.hashContents() == txid) {
+                ret.push_back(tx);
+                break;
+            }
+        }
+    }
+    return std::move(ret);
+}
+
 void BlockChain::popBlock() {
     Block last = this->getBlock(this->getBlockCount());
     Executor::RollbackBlock(last, this->ledger, this->txdb);
@@ -274,6 +299,7 @@ void BlockChain::popBlock() {
     this->totalWork -= base.pow((int)last.getDifficulty());
     this->blockStore.setTotalWork(this->totalWork);
     this->blockStore.setBlockCount(this->numBlocks);
+    this->blockStore.removeBlockWalletTransactions(last);
     if (this->getBlockCount() > 1) {
         Block newLast = this->getBlock(this->getBlockCount());
         this->difficulty = newLast.getDifficulty();
@@ -283,8 +309,17 @@ void BlockChain::popBlock() {
     }
 }
 
+ExecutionStatus BlockChain::addBlockSync(Block& block) {
+    if (this->isSyncing) {
+        return IS_SYNCING;
+    } else {
+        std::unique_lock<std::mutex> ul(lock);
+        return this->addBlock(block);
+    }
+}
+    
+
 ExecutionStatus BlockChain::addBlock(Block& block) {
-    std::unique_lock<std::mutex> ul(lock);
     // check difficulty + nonce
     if (block.getTransactions().size() > MAX_TRANSACTIONS_PER_BLOCK) return INVALID_TRANSACTION_COUNT;
     if (block.getId() != this->numBlocks + 1) return INVALID_BLOCK_ID;
@@ -320,7 +355,7 @@ ExecutionStatus BlockChain::addBlock(Block& block) {
     SHA256Hash computedRoot = m.getRootHash();
     if (block.getMerkleRoot() != computedRoot) return INVALID_MERKLE_ROOT;
     LedgerState deltasFromBlock;
-    ExecutionStatus status = Executor::ExecuteBlock(block, this->ledger, this->txdb, deltasFromBlock, this->getCurrentMiningFee());
+    ExecutionStatus status = Executor::ExecuteBlock(block, this->ledger, this->txdb, deltasFromBlock, this->getCurrentMiningFee(block.getId()));
 
     if (status != SUCCESS) {
         Executor::Rollback(this->ledger, deltasFromBlock);
@@ -330,7 +365,7 @@ ExecutionStatus BlockChain::addBlock(Block& block) {
         }
         // add all transactions to txdb:
         for(auto t : block.getTransactions()) {
-            if (!t.isFee()) this->txdb.insertTransaction(t, block.getId());
+            this->txdb.insertTransaction(t, block.getId());
         }
         this->blockStore.setBlock(block);
         this->numBlocks++;
@@ -349,7 +384,27 @@ map<string, uint64_t> BlockChain::getHeaderChainStats() {
     return this->hosts.getHeaderChainStats();
 }
 
+void BlockChain::recomputeLedger() {
+    this->ledger.clear();
+    this->txdb.clear();
+    for(int i = 1; i <= this->numBlocks; i++) {
+        LedgerState deltas;
+        Block block = this->getBlock(i);
+        ExecutionStatus addResult = Executor::ExecuteBlock(block, this->ledger, this->txdb, deltas, this->getCurrentMiningFee(i));
+        // add all transactions to txdb:
+        for(auto t : block.getTransactions()) {
+            if (!t.isFee()) this->txdb.insertTransaction(t, block.getId());
+        }
+        if (addResult != SUCCESS) {
+            Logger::logError(RED + "[FATAL]" + RESET, "Corrupt blockchain. Exiting. Please delete data dir and sync from scratch.");
+            exit(-1);
+        }
+    }
+}
+
 ExecutionStatus BlockChain::startChainSync() {
+    std::unique_lock<std::mutex> ul(lock);
+    this->isSyncing = true;
     string bestHost = this->hosts.getGoodHost();
     this->targetBlockCount = this->hosts.getBlockCount();
     // If our current chain is lower POW than the trusted host
@@ -392,15 +447,17 @@ ExecutionStatus BlockChain::startChainSync() {
                 if (addResult != SUCCESS) {
                     failure = true;
                     status = addResult;
-                    Logger::logError("Chain failed at blockID", std::to_string(b.getId()));
+                    Logger::logError("Chain failed at blockID, recomputing ledger", std::to_string(b.getId()));
                     break;
                 }
             }
             if (failure) {
                 Logger::logError("BlockChain::startChainSync", executionStatusAsString(status));
+                this->isSyncing = false;
                 return status;
             }
         } catch (const std::exception &e) {
+            this->isSyncing = false;
             Logger::logError("BlockChain::startChainSync", "Failed to load block" + string(e.what()));
             return UNKNOWN_ERROR;
         }
@@ -410,6 +467,7 @@ ExecutionStatus BlockChain::startChainSync() {
     stringstream s;
     s<<"Downloaded " << needed <<" blocks in " << d << " seconds from " + bestHost;
     if (needed > 1) Logger::logStatus(s.str());
+    this->isSyncing = false;
     return SUCCESS;
 }
 

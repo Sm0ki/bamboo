@@ -7,6 +7,7 @@
 #include <string_view>
 #include <atomic>
 #include <signal.h>
+#include <filesystem>
 #include "../core/logger.hpp"
 #include "../core/crypto.hpp"
 #include "../core/host_manager.hpp"
@@ -46,13 +47,30 @@ namespace {
 void BambooServer::run(json config) {
     srand(time(0));
 
+    std::filesystem::path data{ "data" };
+
+    if (!std::filesystem::exists(data)) {
+        Logger::logStatus("Creating data directory...");
+        try {
+            std::filesystem::create_directory(data);
+        }
+        catch (std::exception& e) {
+            std::cout << e.what() << std::endl;
+        }
+    }
+
     Logger::logStatus("Starting server...");
     HostManager hosts(config);
 
+    
+    RequestManager manager(hosts);
+
+    // start downloading headers from peers
+    hosts.syncHeadersWithPeers();
+
+    // start pinging other peers about ourselves
     hosts.startPingingPeers();
 
-    Logger::logStatus("HostManager ready...");
-    RequestManager manager(hosts);
 
     shutdown_handler = [&](int signal) {
         Logger::logStatus("Shutting down server.");
@@ -170,6 +188,12 @@ void BambooServer::run(json config) {
         sendCorsHeaders(res);
         json result;
         try {
+            if (req->getQuery("blockId").length() == 0) {
+                json err;
+                err["error"] = "No query parameters specified";
+                res->writeHeader("Content-Type", "application/json; charset=utf-8")->end(err.dump());
+                return;
+            }
             int blockId= std::stoi(string(req->getQuery("blockId")));
             int count = std::stoi(manager.getBlockCount());
             if (blockId<= 0 || blockId > count) {
@@ -193,6 +217,12 @@ void BambooServer::run(json config) {
         sendCorsHeaders(res);
         json result;
         try {
+            if (req->getQuery("blockId").length() == 0) {
+                json err;
+                err["error"] = "No query parameters specified";
+                res->writeHeader("Content-Type", "application/json; charset=utf-8")->end(err.dump());
+                return;
+            }
             int blockId = std::stoi(string(req->getQuery("blockId")));
             int count = std::stoi(manager.getBlockCount());
             if (blockId <= 0 || blockId > count) {
@@ -215,6 +245,12 @@ void BambooServer::run(json config) {
         rateLimit(manager, res);
         sendCorsHeaders(res);
         try {
+            if (req->getQuery("wallet").length() == 0) {
+                json err;
+                err["error"] = "No query parameters specified";
+                res->writeHeader("Content-Type", "application/json; charset=utf-8")->end(err.dump());
+                return;
+            }
             PublicWalletAddress w = stringToWalletAddress(string(req->getQuery("wallet")));
             json ledger = manager.getLedger(w);
             res->writeHeader("Content-Type", "application/json; charset=utf-8")->end(ledger.dump());
@@ -222,6 +258,26 @@ void BambooServer::run(json config) {
             Logger::logError("/ledger", e.what());
         } catch(...) {
             Logger::logError("/ledger", "unknown");
+        }
+    };
+
+    auto walletHandler = [&manager](auto *res, auto *req) {
+        rateLimit(manager, res);
+        sendCorsHeaders(res);
+        try {
+            if (req->getQuery("wallet").length() == 0) {
+                json err;
+                err["error"] = "No query parameters specified";
+                res->writeHeader("Content-Type", "application/json; charset=utf-8")->end(err.dump());
+                return;
+            }
+            PublicWalletAddress w = stringToWalletAddress(string(req->getQuery("wallet")));
+            json ret = manager.getTransactionsForWallet(w);
+            res->writeHeader("Content-Type", "application/json; charset=utf-8")->end(ret.dump());
+        } catch(const std::exception &e) {
+            Logger::logError("/wallet", e.what());
+        } catch(...) {
+            Logger::logError("/wallet", "unknown");
         }
     };
 
@@ -534,6 +590,12 @@ void BambooServer::run(json config) {
         rateLimit(manager, res);
         sendCorsHeaders(res);
         try {
+            if (req->getQuery("start").length() == 0 || req->getQuery("end").length() == 0) {
+                json err;
+                err["error"] = "No query parameters specified";
+                res->writeHeader("Content-Type", "application/json; charset=utf-8")->end(err.dump());
+                return;
+            }
             int start = std::stoi(string(req->getQuery("start")));
             int end = std::stoi(string(req->getQuery("end")));
             if ((end-start) > BLOCKS_PER_FETCH) {
@@ -562,6 +624,12 @@ void BambooServer::run(json config) {
         rateLimit(manager, res);
         sendCorsHeaders(res);
         try {
+            if (req->getQuery("start").length() == 0 || req->getQuery("end").length() == 0) {
+                json err;
+                err["error"] = "No query parameters specified";
+                res->writeHeader("Content-Type", "application/json; charset=utf-8")->end(err.dump());
+                return;
+            }
             int start = std::stoi(string(req->getQuery("start")));
             int end = std::stoi(string(req->getQuery("end")));
             if ((end-start) > BLOCK_HEADERS_PER_FETCH) {
@@ -696,6 +764,19 @@ void BambooServer::run(json config) {
         });
     };
 
+    auto getNetworkHashrateHandler = [&manager](auto *res, auto *req) {
+        rateLimit(manager, res);
+        sendCorsHeaders(res);
+        try {
+            std::string hashrate = to_string(manager.getNetworkHashrate());
+            res->writeHeader("Content-Type", "text/html; charset=utf-8")->end(hashrate);
+        } catch(const std::exception &e) {
+            Logger::logError("/getnetworkhashrate", e.what());
+        } catch(...) {
+            Logger::logError("/getnetworkhashrate", "unknown");
+        }
+    };
+
     auto mainHandler = [&manager](auto* res, auto*req) {
         rateLimit(manager, res);
         sendCorsHeaders(res);
@@ -737,6 +818,7 @@ void BambooServer::run(json config) {
         .get("/tx_json", txJsonHandler)
         .get("/mine_status", mineStatusHandler)
         .get("/ledger", ledgerHandler)
+        .get("/wallet_transactions", walletHandler)
         .get("/gettx/:blockId", getTxHandler) // DEPRECATED
         .get("/mine_status/:b", mineStatusHandlerDeprecated) // DEPRECATED
         .get("/ledger/:user", ledgerHandlerDeprecated) // DEPRECATED
@@ -744,6 +826,7 @@ void BambooServer::run(json config) {
         .get("/block_headers/:start/:end", blockHeaderHandlerDeprecated) // DEPRECATED
         .get("/block/:b", blockHandlerDeprecated) // DEPRECATED
         .get("/mine", mineHandler)
+        .get("/getnetworkhashrate", getNetworkHashrateHandler)
         .post("/add_peer", addPeerHandler)
         .post("/submit", submitHandler)
         .get("/gettx", getTxHandler)
@@ -761,11 +844,13 @@ void BambooServer::run(json config) {
         .options("/block_count", corsHandler)
         .options("/logs", corsHandler)
         .options("/stats", corsHandler)
+        .options("/wallet_transactions", corsHandler)
         .options("/block", corsHandler)
         .options("/tx_json", corsHandler)
         .options("/mine_status", corsHandler)
         .options("/ledger", corsHandler)
         .options("/mine", corsHandler)
+        .options("/getnetworkhashrate", corsHandler)
         .options("/add_peer", corsHandler)
         .options("/submit", corsHandler)
         .options("/gettx", corsHandler)

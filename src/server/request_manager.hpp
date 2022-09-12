@@ -24,6 +24,7 @@ class RequestManager {
         json getBlock(uint32_t blockId);
         json getLedger(PublicWalletAddress w);
         json getStats();
+        json getTransactionsForWallet(PublicWalletAddress addr);
         json verifyTransaction(Transaction& t);
         json getTransactionStatus(SHA256Hash txid);
         json getPeers();
@@ -35,6 +36,7 @@ class RequestManager {
         std::pair<char*, size_t> getRawTransactionData();
         string getBlockCount();
         string getTotalWork();
+        uint64_t getNetworkHashrate();
         void exit();
         void deleteDB();
         void enableRateLimiting(bool enabled);

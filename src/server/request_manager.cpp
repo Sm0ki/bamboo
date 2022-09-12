@@ -1,6 +1,7 @@
 #include <map>
 #include <iostream>
 #include <future>
+#include <math.h>
 #include "../core/helpers.hpp"
 #include "../core/logger.hpp"
 #include "../core/merkle_tree.hpp"
@@ -60,6 +61,15 @@ void RequestManager::deleteDB() {
     this->blockchain->deleteDB();
 }
 
+json RequestManager::getTransactionsForWallet(PublicWalletAddress addr) {
+    json ret = json::array();
+    vector<Transaction> txs = this->blockchain->getTransactionsForWallet(addr);
+    for(auto tx : txs) {
+        ret.push_back(tx.toJson());
+    }
+    return ret;
+}
+
 bool RequestManager::acceptRequest(std::string& ip) {
     if (!this->limitRequests) return true;
     return this->rateLimiter->limit(ip);
@@ -80,7 +90,7 @@ json RequestManager::submitProofOfWork(Block& newBlock) {
     }
     // build map of all public keys in transaction
     // add to the chain!
-    ExecutionStatus status = this->blockchain->addBlock(newBlock);
+    ExecutionStatus status = this->blockchain->addBlockSync(newBlock);
     result["status"] = executionStatusAsString(status);
     
     if (status == SUCCESS) {
@@ -177,7 +187,7 @@ json RequestManager::getProofOfWork() {
     result["lastHash"] = SHA256toString(this->blockchain->getLastHash());
     result["challengeSize"] = this->blockchain->getDifficulty();
     result["chainLength"] = this->blockchain->getBlockCount();
-    result["miningFee"] = this->blockchain->getCurrentMiningFee();
+    result["miningFee"] = this->blockchain->getCurrentMiningFee(this->blockchain->getBlockCount());
     BlockHeader last = this->blockchain->getBlockHeader(this->blockchain->getBlockCount());
     result["lastTimestamp"] = uint64ToString(last.timestamp);
     return result;
@@ -242,6 +252,34 @@ string RequestManager::getBlockCount() {
 string RequestManager::getTotalWork() {
     Bigint totalWork = this->blockchain->getTotalWork();
     return to_string(totalWork);
+}
+
+uint64_t RequestManager::getNetworkHashrate() {
+    auto blockCount = this->blockchain->getBlockCount();
+
+    uint64_t totalWork = 0;
+
+    int blockStart = blockCount < 52 ? 2 : blockCount - 50;
+    int blockEnd = blockCount;
+
+    int start = 0;
+    int end = 0;
+
+    for (int blockId = blockStart; blockId <= blockEnd; blockId++) {
+        auto header = this->blockchain->getBlockHeader(blockId);
+
+        if (blockId == blockStart) {
+            start = header.timestamp;
+        }
+
+        if (blockId == blockEnd) {
+            end = header.timestamp;
+        }
+
+        totalWork += pow(2, header.difficulty);
+    }
+
+    return totalWork / (end - start);
 }
 
 json RequestManager::getStats() {
